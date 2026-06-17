@@ -10,6 +10,13 @@ import ARKit
 import RealityKit
 import Combine
 
+// MARK: - SIMD Extensions
+extension SIMD4 where Scalar == Float {
+    var xyz: SIMD3<Float> {
+        return SIMD3<Float>(x, y, z)
+    }
+}
+
 /// Manages the room scanning process and object detection
 class RoomScanManager: ObservableObject {
     @Published var detectedObjects: [DetectedObject] = []
@@ -20,18 +27,35 @@ class RoomScanManager: ObservableObject {
     
     private var meshAnchors: [UUID: ARMeshAnchor] = [:]
     private var scanStartTime: Date?
-    private let minObjectVolume: Float = 0.01 // 10cm³ minimum
-    private let maxObjectVolume: Float = 100.0 // 100m³ maximum
+    
+    // Size thresholds for object detection
+    // Balance between excluding small clutter and detecting meaningful furniture
+    // TEMPORARILY RELAXED FOR DEBUGGING
+    private let minObjectVolume: Float = 0.01 // Very low for debugging
+    private let minObjectDimension: Float = 0.05 // 5cm minimum  
+    private let minAverageDimension: Float = 0.10 // 10cm average - very low for debugging
+    private let maxObjectVolume: Float = 5.0 // Increased for debugging
+    
+    private let classifier = ObjectClassifier() // AI-driven classifier
+    private var currentFrame: ARFrame? // Store latest frame for vision analysis
     
     // MARK: - Scanning Control
     
     /// Start scanning the room
     func startScanning() {
-        print("🔍 Starting room scan...")
+        print("🔍 ========== STARTING ROOM SCAN ==========")
+        print("   Previous meshAnchorsCount: \(meshAnchorsCount)")
+        print("   Previous detectedObjects: \(detectedObjects.count)")
+        
         isScanning = true
         scanStartTime = Date()
         statusMessage = "Scanning... Move slowly around the room"
         clearScan()
+        
+        print("   After clearScan:")
+        print("   meshAnchorsCount: \(meshAnchorsCount)")
+        print("   detectedObjects: \(detectedObjects.count)")
+        print("========================================")
     }
     
     /// Stop scanning
@@ -55,7 +79,10 @@ class RoomScanManager: ObservableObject {
     
     /// Process a new mesh anchor from ARKit
     func processMeshAnchor(_ anchor: ARMeshAnchor) {
-        guard isScanning else { return }
+        guard isScanning else {
+            print("⚠️ processMeshAnchor called but not scanning - ignoring")
+            return
+        }
         
         // Store or update the mesh anchor
         meshAnchors[anchor.identifier] = anchor
@@ -65,7 +92,18 @@ class RoomScanManager: ObservableObject {
         // Most rooms have 20-100 mesh anchors
         scanProgress = min(Float(meshAnchorsCount) / 50.0, 1.0)
         
-        print("📊 Processed mesh anchor. Total: \(meshAnchorsCount)")
+        print("📊 Processed mesh anchor #\(meshAnchorsCount)")
+        
+        // Auto-generate wireframes during scanning (every 5 meshes for more responsive updates)
+        if meshAnchorsCount % 5 == 0 {
+            print("   🔄 Triggering wireframe generation at \(meshAnchorsCount) meshes")
+            generateWireframesRealtime()
+        }
+    }
+    
+    /// Update current AR frame for vision-based classification
+    func updateFrame(_ frame: ARFrame) {
+        currentFrame = frame
     }
     
     /// Update an existing mesh anchor
@@ -82,100 +120,294 @@ class RoomScanManager: ObservableObject {
     
     // MARK: - Object Generation
     
+    /// Generate wireframes in real-time during scanning (simpler, faster)
+    private func generateWireframesRealtime() {
+        print("🔄 Real-time wireframe generation - mesh count: \(meshAnchorsCount)")
+        
+        // Don't classify during scanning, just show bounding boxes
+        let groupedObjects = groupMeshesIntoObjects()
+        
+        print("   Grouped into \(groupedObjects.count) potential objects")
+        
+        // Build new object set
+        var newObjects: [DetectedObject] = []
+        var filteredByVolume = 0
+        var filteredByDimension = 0
+        
+        for group in groupedObjects {
+            if let object = createObjectFromMeshGroup(group) {
+                let volume = object.volume
+                let size = object.boundingBox.size
+                
+                // Check volume
+                if volume < minObjectVolume {
+                    filteredByVolume += 1
+                    print("   ❌ Filtered by volume: \(volume) < \(minObjectVolume) - size: \(size)")
+                    continue
+                }
+                
+                if volume > maxObjectVolume {
+                    filteredByVolume += 1
+                    print("   ❌ Filtered by volume: \(volume) > \(maxObjectVolume) - size: \(size)")
+                    continue
+                }
+                
+                object.label = "Scanning..."
+                newObjects.append(object)
+                print("   ✅ Added object - volume: \(volume), size: \(size)")
+            } else {
+                filteredByDimension += 1
+            }
+        }
+        
+        print("   Created \(newObjects.count) valid objects")
+        print("   Filtered: \(filteredByVolume) by volume, \(filteredByDimension) by dimension")
+        
+        // Replace objects array - this triggers the publisher
+        detectedObjects = newObjects
+        
+        print("   ✅ Updated detectedObjects array")
+    }
+    
     /// Generate objects and wireframes from collected mesh data
     func generateWireframes() {
         print("🎨 Generating wireframes from \(meshAnchorsCount) mesh anchors...")
         statusMessage = "Processing mesh data..."
         
         detectedObjects.removeAll()
+        print("   Cleared existing objects")
         
-        // Process each mesh anchor
-        for (_, meshAnchor) in meshAnchors {
-            if let object = createObjectFromMesh(meshAnchor) {
-                // Filter by volume
+        // Group nearby meshes into objects
+        let groupedObjects = groupMeshesIntoObjects()
+        print("   Grouped into \(groupedObjects.count) potential objects")
+        
+        // Filter and create detected objects
+        for group in groupedObjects {
+            if let object = createObjectFromMeshGroup(group) {
+                // Filter by volume to remove tiny fragments and huge walls
                 if object.volume >= minObjectVolume && object.volume <= maxObjectVolume {
                     detectedObjects.append(object)
+                    print("   ✅ Added object with volume: \(object.volume)")
                 }
             }
         }
         
-        // Classify objects
-        classifyObjects()
+        print("📦 Created \(detectedObjects.count) objects from \(meshAnchorsCount) mesh anchors")
         
-        statusMessage = "Generated \(detectedObjects.count) objects"
-        print("✅ Generated \(detectedObjects.count) wireframe objects")
+        // Force array update to trigger publisher
+        detectedObjects = detectedObjects
+        print("   Triggered detectedObjects publisher")
+        
+        // Classify objects using AI-driven classifier
+        Task { @MainActor in
+            await classifyObjectsWithAI()
+            // Trigger UI update after classification completes
+            self.detectedObjects = self.detectedObjects
+            print("   Triggered post-classification update")
+        }
     }
     
-    // MARK: - Object Creation
-    
-    private func createObjectFromMesh(_ meshAnchor: ARMeshAnchor) -> DetectedObject? {
-        let boundingBox = calculateBoundingBox(for: meshAnchor)
+    /// Group nearby mesh anchors into logical objects
+    private func groupMeshesIntoObjects() -> [[ARMeshAnchor]] {
+        // Filter meshes to exclude large planar surfaces (walls, floors, ceilings)
+        var objectMeshes: [ARMeshAnchor] = []
         
-        // Filter out very small or very large objects
-        guard boundingBox.size.x > 0.05 && boundingBox.size.y > 0.05 && boundingBox.size.z > 0.05 else {
+        for anchor in meshAnchors.values {
+            let geometry = anchor.geometry
+            
+            // Calculate rough bounds in local space
+            let vertices = geometry.vertices
+            var minBounds = SIMD3<Float>(repeating: .infinity)
+            var maxBounds = SIMD3<Float>(repeating: -.infinity)
+            
+            let vertexCount = min(vertices.count, 100) // Sample first 100 vertices for speed
+            let vertexBuffer = vertices.buffer
+            let vertexStride = vertices.stride
+            let vertexOffset = vertices.offset
+            
+            for i in 0..<vertexCount {
+                let vertexPointer = vertexBuffer.contents().advanced(by: vertexOffset + (i * vertexStride))
+                let vertex = vertexPointer.assumingMemoryBound(to: SIMD3<Float>.self).pointee
+                minBounds = min(minBounds, vertex)
+                maxBounds = max(maxBounds, vertex)
+            }
+            
+            let size = maxBounds - minBounds
+            
+            // Filter out large, flat surfaces (likely walls/floors)
+            // AND very small objects (knick-knacks, small items on tables)
+            // Use smart filtering:
+            // - Not too large in any dimension (< 2 meters)
+            // - All dimensions above minimum (> 5cm to avoid noise)
+            // - Average dimension above threshold (> 35cm to avoid small clutter)
+            let maxDimension = max(size.x, max(size.y, size.z))
+            let minDimension = min(size.x, min(size.y, size.z))
+            let avgDimension = (size.x + size.y + size.z) / 3.0
+            
+            let meetsMinimumSize = minDimension > 0.05 // All dimensions > 5cm
+            let meetsAverageSize = avgDimension >= minAverageDimension // Average >= 35cm
+            
+            if maxDimension < 2.0 && meetsMinimumSize && meetsAverageSize {
+                objectMeshes.append(anchor)
+                print("   ✓ Mesh passed filter - size: \(size), avg: \(avgDimension)m")
+            } else {
+                print("   ✗ Mesh filtered - size: \(size), avg: \(avgDimension)m, max: \(maxDimension)m")
+            }
+        }
+        
+        // For now, treat each filtered mesh as its own object
+        // Future: implement actual clustering of nearby meshes
+        return objectMeshes.map { [$0] }
+    }
+    
+    /// Create a single object from a group of mesh anchors
+    private func createObjectFromMeshGroup(_ meshGroup: [ARMeshAnchor]) -> DetectedObject? {
+        guard !meshGroup.isEmpty else { return nil }
+        
+        // Calculate combined bounding box
+        var minBounds = SIMD3<Float>(repeating: .infinity)
+        var maxBounds = SIMD3<Float>(repeating: -.infinity)
+        
+        for meshAnchor in meshGroup {
+            let geometry = meshAnchor.geometry
+            let vertices = geometry.vertices
+            let transform = meshAnchor.transform
+            
+            let vertexCount = vertices.count
+            let vertexBuffer = vertices.buffer
+            let vertexStride = vertices.stride
+            let vertexOffset = vertices.offset
+            
+            for i in 0..<vertexCount {
+                let vertexPointer = vertexBuffer.contents().advanced(by: vertexOffset + (i * vertexStride))
+                let vertex = vertexPointer.assumingMemoryBound(to: SIMD3<Float>.self).pointee
+                
+                // Transform to world space
+                let worldPos = transform * SIMD4<Float>(vertex.x, vertex.y, vertex.z, 1)
+                let worldVertex = SIMD3<Float>(worldPos.x, worldPos.y, worldPos.z)
+                
+                minBounds = min(minBounds, worldVertex)
+                maxBounds = max(maxBounds, worldVertex)
+            }
+        }
+        
+        // Calculate center and size
+        let center = (minBounds + maxBounds) / 2
+        let size = maxBounds - minBounds
+        
+        // Filter out small objects using smart threshold
+        // Check average dimension to exclude small clutter
+        let avgDimension = (size.x + size.y + size.z) / 3.0
+        let minDimension = min(size.x, min(size.y, size.z))
+        
+        guard minDimension > minObjectDimension && avgDimension >= minAverageDimension else {
+            print("   ✗ Object filtered - size: \(size), avg: \(avgDimension)m, min: \(minDimension)m")
             return nil
         }
         
+        print("   ✓ Object created - size: \(size), avg: \(avgDimension)m")
+        
+        let boundingBox = BoundingBox(
+            center: center,
+            size: size,
+            rotation: simd_quatf()
+        )
+        
         let object = DetectedObject(
             boundingBox: boundingBox,
-            meshAnchor: meshAnchor,
+            meshAnchor: meshGroup.first,
             label: "Object"
         )
         
         return object
     }
     
-    private func calculateBoundingBox(for meshAnchor: ARMeshAnchor) -> BoundingBox {
-        let geometry = meshAnchor.geometry
-        let vertices = geometry.vertices
+    // MARK: - AI-Driven Classification
+    
+    /// Classify objects using enhanced AI classifier
+    @MainActor
+    private func classifyObjectsWithAI() async {
+        statusMessage = "Classifying objects..."
         
-        var minBounds = SIMD3<Float>(repeating: .infinity)
-        var maxBounds = SIMD3<Float>(repeating: -.infinity)
-        
-        // Access vertex data through the buffer
-        let vertexCount = vertices.count
-        let vertexBuffer = vertices.buffer
-        let vertexStride = vertices.stride
-        let vertexOffset = vertices.offset
-        
-        // Find min and max bounds
-        for i in 0..<vertexCount {
-            let vertexPointer = vertexBuffer.contents().advanced(by: vertexOffset + (i * vertexStride))
-            let vertex = vertexPointer.assumingMemoryBound(to: SIMD3<Float>.self).pointee
-            
-            minBounds = min(minBounds, vertex)
-            maxBounds = max(maxBounds, vertex)
+        // If no objects, nothing to classify
+        guard !detectedObjects.isEmpty else {
+            statusMessage = "No objects detected"
+            return
         }
         
-        // Calculate center and size in local space
-        let localCenter = (minBounds + maxBounds) / 2
-        let size = maxBounds - minBounds
+        print("🔍 Classifying \(detectedObjects.count) objects...")
         
-        // Transform to world space
-        let transform = meshAnchor.transform
-        let worldCenter = transform * SIMD4<Float>(localCenter.x, localCenter.y, localCenter.z, 1)
+        for (index, object) in detectedObjects.enumerated() {
+            // Use AI classifier (geometry-based only for stability)
+            // Vision classification is disabled temporarily to prevent crashes
+            let result = await classifier.classifyWithVision(object: object, frame: nil)
+            
+            // Update object with classification results
+            object.label = "\(result.label) (\(result.category.displayName))"
+            object.confidence = result.confidence
+            
+            // Add metadata for furniture vs structure
+            if !result.isMovable {
+                object.label = "🏗️ " + object.label
+            } else {
+                object.label = "🪑 " + object.label
+            }
+            
+            print("  [\(index+1)/\(detectedObjects.count)] \(object.label) - confidence: \(result.confidence)")
+        }
         
-        return BoundingBox(
-            center: SIMD3<Float>(worldCenter.x, worldCenter.y, worldCenter.z),
-            size: size,
-            rotation: simd_quatf(transform)
-        )
+        statusMessage = "Generated \(detectedObjects.count) objects"
+        print("✅ Generated \(detectedObjects.count) wireframe objects with AI classification")
     }
     
     // MARK: - Object Classification
     
-    private func classifyObjects() {
-        for object in detectedObjects {
-            object.label = classifyObject(object)
-        }
-    }
-    
     /// Update the visibility of an object
     func updateObjectVisibility(_ object: DetectedObject) {
         // The object's isVisible property is already updated
-        // This method can be used to trigger additional updates if needed
-        print("👁️ Object \(object.label) visibility: \(object.isVisible)")
-        objectWillChange.send()
+        // Force a refresh by reassigning the array (triggers @Published)
+        detectedObjects = detectedObjects
+    }
+    
+    /// Toggle visibility of all wireframes at once
+    func toggleAllWireframes(visible: Bool) {
+        print("👁️ Toggling wireframes to: \(visible ? "visible" : "hidden")")
+        print("   Total objects: \(detectedObjects.count)")
+        
+        for object in detectedObjects {
+            object.isVisible = visible
+            print("   Set \(object.label) visibility to \(visible)")
+        }
+        
+        // Force a refresh by reassigning the array (triggers @Published)
+        detectedObjects = detectedObjects
+        
+        print("   Sent array update notification")
+    }
+    
+    /// TEST METHOD: Create a simple test wireframe directly in front of camera
+    func createTestWireframe() {
+        print("🧪 Creating test wireframe...")
+        
+        // Create a simple box 1 meter in front of the camera
+        let testBox = BoundingBox(
+            center: SIMD3<Float>(0, 0, -1), // 1 meter in front
+            size: SIMD3<Float>(0.3, 0.3, 0.3), // 30cm cube
+            rotation: simd_quatf()
+        )
+        
+        let testObject = DetectedObject(
+            boundingBox: testBox,
+            meshAnchor: nil,
+            label: "🧪 TEST BOX",
+            color: .systemPink
+        )
+        
+        detectedObjects.append(testObject)
+        detectedObjects = detectedObjects // Force update
+        
+        print("   ✅ Test object created at \(testBox.center)")
+        print("   Total objects now: \(detectedObjects.count)")
     }
     
     private func classifyObject(_ object: DetectedObject) -> String {

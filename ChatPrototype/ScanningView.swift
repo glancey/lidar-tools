@@ -9,18 +9,45 @@ import SwiftUI
 import ARKit
 import RealityKit
 import UIKit
+import Combine
 
 struct ScanningView: View {
     @ObservedObject var scanManager: RoomScanManager
     @Binding var appMode: AppMode
     @State private var showingObjectList = false
     @State private var showingExportSheet = false
+    @State private var wireframeMessage: String = ""
+    @State private var showWireframeMessage: Bool = false
+    @State private var wireframesVisible: Bool = true  // Track wireframe visibility
+    
+    init(scanManager: RoomScanManager, appMode: Binding<AppMode>) {
+        print("🚀 ScanningView.init() called")
+        self.scanManager = scanManager
+        self._appMode = appMode
+        print("🚀 ScanningView.init() completed")
+    }
     
     var body: some View {
         ZStack {
             // AR View
             ARScanningView(scanManager: scanManager)
                 .ignoresSafeArea()
+            
+            // Wireframe generation message
+            if showWireframeMessage {
+                VStack {
+                    Spacer()
+                    Text(wireframeMessage)
+                        .font(.headline)
+                        .foregroundColor(.white)
+                        .padding()
+                        .background(Color.green.opacity(0.9))
+                        .cornerRadius(12)
+                        .shadow(radius: 10)
+                        .padding(.bottom, 100)
+                }
+                .transition(.opacity)
+            }
             
             VStack {
                 Spacer()
@@ -70,7 +97,12 @@ struct ScanningView: View {
                                     .cornerRadius(8)
                             }
                         } else {
-                            Button(action: { scanManager.startScanning() }) {
+                            Button(action: { 
+                                print("▶️ START SCAN button pressed")
+                                scanManager.startScanning()
+                                print("   isScanning: \(scanManager.isScanning)")
+                                print("   meshAnchorsCount: \(scanManager.meshAnchorsCount)")
+                            }) {
                                 Image(systemName: "play.circle.fill")
                                     .foregroundColor(.white)
                                     .padding(8)
@@ -78,42 +110,23 @@ struct ScanningView: View {
                                     .cornerRadius(8)
                             }
                             
+                            // Only show these buttons when NOT scanning AND we have mesh data
                             if scanManager.meshAnchorsCount > 0 {
-                                Button(action: { scanManager.generateWireframes() }) {
-                                    Image(systemName: "cube.transparent")
+                                Button(action: { showingExportSheet = true }) {
+                                    Image(systemName: "square.and.arrow.up")
                                         .foregroundColor(.white)
                                         .padding(8)
-                                        .background(.blue.opacity(0.8))
+                                        .background(.orange.opacity(0.8))
                                         .cornerRadius(8)
                                 }
-                            }
-                        }
-                        
-                        if !scanManager.detectedObjects.isEmpty {
-                            Button(action: { showingObjectList = true }) {
-                                Image(systemName: "list.bullet")
-                                    .foregroundColor(.white)
-                                    .padding(8)
-                                    .background(.purple.opacity(0.8))
-                                    .cornerRadius(8)
-                            }
-                            
-                            Button(action: { showingExportSheet = true }) {
-                                Image(systemName: "square.and.arrow.up")
-                                    .foregroundColor(.white)
-                                    .padding(8)
-                                    .background(.orange.opacity(0.8))
-                                    .cornerRadius(8)
-                            }
-                        }
-                        
-                        if scanManager.meshAnchorsCount > 0 || !scanManager.detectedObjects.isEmpty {
-                            Button(action: { scanManager.clearScan() }) {
-                                Image(systemName: "trash")
-                                    .foregroundColor(.white)
-                                    .padding(8)
-                                    .background(.gray.opacity(0.8))
-                                    .cornerRadius(8)
+                                
+                                Button(action: { scanManager.clearScan() }) {
+                                    Image(systemName: "trash")
+                                        .foregroundColor(.white)
+                                        .padding(8)
+                                        .background(.gray.opacity(0.8))
+                                        .cornerRadius(8)
+                                }
                             }
                         }
                         
@@ -142,6 +155,21 @@ struct ScanningView: View {
         .sheet(isPresented: $showingExportSheet) {
             ExportView(scanManager: scanManager)
         }
+        .onAppear {
+            // Prevent screen from dimming during scanning
+            UIApplication.shared.isIdleTimerDisabled = true
+            print("🔆 Screen dimming disabled")
+        }
+        .onDisappear {
+            // Re-enable screen dimming when leaving scanning view
+            UIApplication.shared.isIdleTimerDisabled = false
+            print("🔅 Screen dimming re-enabled")
+        }
+        .onChange(of: scanManager.isScanning) { isScanning in
+            // Also manage screen dimming based on scanning state
+            UIApplication.shared.isIdleTimerDisabled = isScanning
+            print(isScanning ? "🔆 Screen dimming disabled (scanning)" : "🔅 Screen dimming re-enabled (not scanning)")
+        }
     }
 }
 
@@ -154,6 +182,7 @@ struct ARScanningView: UIViewRepresentable {
         
         // Set delegate
         arView.session.delegate = context.coordinator
+        print("✅ Set AR session delegate")
         
         // Configure AR session with mesh reconstruction
         let config = ARWorldTrackingConfiguration()
@@ -169,6 +198,7 @@ struct ARScanningView: UIViewRepresentable {
         config.environmentTexturing = .automatic
         
         arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        print("✅ AR session started")
         
         context.coordinator.arView = arView
         context.coordinator.scanManager = scanManager
@@ -177,8 +207,7 @@ struct ARScanningView: UIViewRepresentable {
     }
     
     func updateUIView(_ uiView: ARView, context: Context) {
-        // Update wireframes when objects change
-        context.coordinator.updateWireframes()
+        // Updates handled by Combine publishers
     }
     
     func makeCoordinator() -> Coordinator {
@@ -189,12 +218,30 @@ struct ARScanningView: UIViewRepresentable {
         weak var arView: ARView?
         var scanManager: RoomScanManager
         private var wireframeAnchors: [UUID: AnchorEntity] = [:]
+        private var cancellables = Set<AnyCancellable>()
+        private var isUpdatingWireframes = false
         
         init(scanManager: RoomScanManager) {
             self.scanManager = scanManager
+            super.init()
+            
+            // Observe changes to detected objects and update wireframes
+            // Use debounce to prevent too many rapid updates, but make it faster
+            scanManager.$detectedObjects
+                .debounce(for: .milliseconds(100), scheduler: DispatchQueue.main)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    self?.updateWireframes()
+                }
+                .store(in: &cancellables)
         }
         
         // MARK: - ARSessionDelegate
+        
+        func session(_ session: ARSession, didUpdate frame: ARFrame) {
+            // Pass current frame to scan manager for vision-based classification
+            scanManager.updateFrame(frame)
+        }
         
         func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
             for anchor in anchors {
@@ -238,75 +285,135 @@ struct ARScanningView: UIViewRepresentable {
         // MARK: - Wireframe Rendering
         
         func updateWireframes() {
-            guard let arView = arView else { return }
+            guard let arView = arView else {
+                print("⚠️ updateWireframes: arView is nil")
+                return
+            }
+            
+            // Prevent concurrent updates
+            guard !isUpdatingWireframes else {
+                print("⏭️ Skipping wireframe update - already in progress")
+                return
+            }
+            
+            isUpdatingWireframes = true
+            defer { isUpdatingWireframes = false }
+            
+            let totalObjects = scanManager.detectedObjects.count
+            print("🔄 updateWireframes called - detectedObjects count: \(totalObjects)")
             
             // Remove old wireframes
+            let oldCount = wireframeAnchors.count
             for (_, anchor) in wireframeAnchors {
                 arView.scene.removeAnchor(anchor)
             }
             wireframeAnchors.removeAll()
             
+            print("   Cleared \(oldCount) old wireframes")
+            
             // Add new wireframes for visible objects
-            for object in scanManager.detectedObjects where object.isVisible {
-                let wireframe = createWireframe(for: object)
-                let anchor = AnchorEntity(world: .zero)
+            let visibleObjects = scanManager.detectedObjects.filter { $0.isVisible }
+            
+            print("   Found \(visibleObjects.count) visible objects (out of \(totalObjects) total)")
+            
+            for (index, object) in visibleObjects.enumerated() {
+                // Create anchor at the object's world position with its rotation
+                let anchor = AnchorEntity(world: object.boundingBox.center)
+                anchor.orientation = object.boundingBox.rotation
+                
+                // Create and add wireframe box
+                let wireframe = createWireframeBox(for: object)
                 anchor.addChild(wireframe)
+                
                 arView.scene.addAnchor(anchor)
                 wireframeAnchors[object.id] = anchor
+                
+                if (index + 1) % 10 == 0 || index == visibleObjects.count - 1 {
+                    print("   Created wireframe \(index + 1)/\(visibleObjects.count)")
+                }
             }
+            
+            print("✅ Created \(wireframeAnchors.count) wireframes total")
         }
         
-        func createWireframe(for object: DetectedObject) -> ModelEntity {
-            let box = object.boundingBox
-            let corners = box.corners
+        func createWireframeBox(for object: DetectedObject) -> Entity {
+            let size = object.boundingBox.size
+            let halfSize = SIMD3<Float>(size.x / 2, size.y / 2, size.z / 2)
             
-            let wireframeEntity = ModelEntity()
+            // Container entity to hold all the edge lines
+            let wireframeEntity = Entity()
             
-            // Define the 12 edges of a bounding box
+            // Define the 8 corners of the box
+            let corners: [SIMD3<Float>] = [
+                SIMD3(-halfSize.x, -halfSize.y, -halfSize.z), // 0: bottom-front-left
+                SIMD3( halfSize.x, -halfSize.y, -halfSize.z), // 1: bottom-front-right
+                SIMD3( halfSize.x, -halfSize.y,  halfSize.z), // 2: bottom-back-right
+                SIMD3(-halfSize.x, -halfSize.y,  halfSize.z), // 3: bottom-back-left
+                SIMD3(-halfSize.x,  halfSize.y, -halfSize.z), // 4: top-front-left
+                SIMD3( halfSize.x,  halfSize.y, -halfSize.z), // 5: top-front-right
+                SIMD3( halfSize.x,  halfSize.y,  halfSize.z), // 6: top-back-right
+                SIMD3(-halfSize.x,  halfSize.y,  halfSize.z)  // 7: top-back-left
+            ]
+            
+            // Define the 12 edges of the box (pairs of corner indices)
             let edges: [(Int, Int)] = [
                 // Bottom face
-                (0, 1), (1, 3), (3, 2), (2, 0),
+                (0, 1), (1, 2), (2, 3), (3, 0),
                 // Top face
-                (4, 5), (5, 7), (7, 6), (6, 4),
+                (4, 5), (5, 6), (6, 7), (7, 4),
                 // Vertical edges
                 (0, 4), (1, 5), (2, 6), (3, 7)
             ]
             
+            // Create a cylinder for each edge
+            let edgeRadius: Float = 0.005 // Thin lines for wireframe effect
+            
+            // Use a consistent bright color for all wireframes
+            let wireframeColor = UIColor.systemYellow
+            
             for (startIdx, endIdx) in edges {
                 let start = corners[startIdx]
                 let end = corners[endIdx]
-                let edge = createEdge(from: start, to: end, color: object.color, thickness: 0.008)
+                
+                // Calculate edge properties
+                let midpoint = (start + end) / 2
+                let direction = end - start
+                let length = simd_length(direction)
+                
+                // Create cylinder mesh for this edge
+                let cylinder = MeshResource.generateCylinder(height: length, radius: edgeRadius)
+                
+                // Create material with consistent wireframe color
+                var material = UnlitMaterial(color: wireframeColor)
+                
+                let edge = ModelEntity(mesh: cylinder, materials: [material])
+                
+                // Position at midpoint
+                edge.position = midpoint
+                
+                // Rotate to align with edge direction
+                if length > 0.0001 {
+                    let up = SIMD3<Float>(0, 1, 0)
+                    let normalizedDirection = simd_normalize(direction)
+                    
+                    // Calculate rotation to align cylinder (which points up by default) with edge direction
+                    let rotationAxis = simd_cross(up, normalizedDirection)
+                    let rotationAxisLength = simd_length(rotationAxis)
+                    
+                    if rotationAxisLength > 0.0001 {
+                        let angle = acos(simd_dot(up, normalizedDirection))
+                        let normalizedAxis = simd_normalize(rotationAxis)
+                        edge.orientation = simd_quatf(angle: angle, axis: normalizedAxis)
+                    } else if simd_dot(up, normalizedDirection) < 0 {
+                        // Edge points down, rotate 180 degrees
+                        edge.orientation = simd_quatf(angle: .pi, axis: SIMD3<Float>(1, 0, 0))
+                    }
+                }
+                
                 wireframeEntity.addChild(edge)
             }
             
             return wireframeEntity
-        }
-        
-        func createEdge(from start: SIMD3<Float>, to end: SIMD3<Float>, color: UIColor, thickness: Float) -> ModelEntity {
-            let vector = end - start
-            let length = simd_length(vector)
-            let direction = simd_normalize(vector)
-            
-            // Create cylinder mesh
-            let cylinder = ModelEntity(
-                mesh: .generateBox(width: thickness, height: length, depth: thickness),
-                materials: [SimpleMaterial(color: color, isMetallic: false)]
-            )
-            
-            // Position at midpoint
-            let midpoint = (start + end) / 2
-            cylinder.position = midpoint
-            
-            // Rotate to align with direction
-            let up = SIMD3<Float>(0, 1, 0)
-            let angle = acos(dot(up, direction))
-            let axis = cross(up, direction)
-            
-            if simd_length(axis) > 0.001 {
-                cylinder.orientation = simd_quatf(angle: angle, axis: normalize(axis))
-            }
-            
-            return cylinder
         }
     }
 }
@@ -389,6 +496,7 @@ struct ExportView: View {
     @State private var saveAlertMessage: String = ""
     @State private var showingShareSheet: Bool = false
     @State private var shareFileURL: URL?
+    @State private var exportTask: Task<Void, Never>?
     
     enum ExportFormat: String, CaseIterable {
         case json = "JSON"
@@ -489,9 +597,16 @@ struct ExportView: View {
                             HStack {
                                 ProgressView()
                                     .padding()
-                                Text("Generating export data...")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Generating export data...")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    if exportFormat == .obj {
+                                        Text("This may take a moment for large scans")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
                             }
                             .frame(maxWidth: .infinity)
                             .padding()
@@ -500,107 +615,100 @@ struct ExportView: View {
                             .padding(.horizontal)
                         } else {
                             VStack(alignment: .leading, spacing: 8) {
-                                // Show file size info instead of full content for large files
-                                if exportFormat == .obj {
-                                    VStack(alignment: .leading, spacing: 12) {
-                                        HStack {
-                                            Image(systemName: "doc.text.fill")
-                                                .font(.largeTitle)
-                                                .foregroundColor(.blue)
-                                            VStack(alignment: .leading, spacing: 4) {
-                                                Text("OBJ File Ready")
-                                                    .font(.headline)
-                                                Text("\(exportData.count) characters")
-                                                    .font(.caption)
-                                                    .foregroundColor(.secondary)
-                                                Text("≈ \(formatBytes(exportData.utf8.count))")
-                                                    .font(.caption)
-                                                    .foregroundColor(.secondary)
-                                            }
-                                        }
-                                        
-                                        Divider()
-                                        
-                                        Text("Preview (first 20 lines):")
-                                            .font(.caption)
-                                            .fontWeight(.semibold)
-                                            .foregroundColor(.secondary)
-                                        
-                                        Text(exportData.split(separator: "\n").prefix(20).joined(separator: "\n"))
-                                            .font(.system(.caption2, design: .monospaced))
-                                            .foregroundColor(.secondary)
-                                        
-                                        if exportData.split(separator: "\n").count > 20 {
-                                            Text("... (\(exportData.split(separator: "\n").count - 20) more lines)")
-                                                .font(.caption2)
+                                // Show file size info and preview for both formats
+                                VStack(alignment: .leading, spacing: 12) {
+                                    HStack {
+                                        Image(systemName: "doc.text.fill")
+                                            .font(.largeTitle)
+                                            .foregroundColor(exportFormat == .obj ? .blue : .green)
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text("\(exportFormat.rawValue) File Ready")
+                                                .font(.headline)
+                                            Text("\(exportData.count) characters")
+                                                .font(.caption)
                                                 .foregroundColor(.secondary)
-                                                .italic()
+                                            Text("≈ \(formatBytes(exportData.utf8.count))")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
                                         }
                                     }
-                                    .padding()
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(Color.secondary.opacity(0.1))
-                                    .cornerRadius(8)
-                                    .padding(.horizontal)
-                                } else {
-                                    // For JSON, show full content since it's smaller
-                                    Text(exportData)
-                                        .font(.system(.caption, design: .monospaced))
-                                        .padding()
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .background(Color.secondary.opacity(0.1))
-                                        .cornerRadius(8)
-                                        .textSelection(.enabled)
-                                        .padding(.horizontal)
+                                    
+                                    Divider()
+                                    
+                                    Text("Preview (first 20 lines):")
+                                        .font(.caption)
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(.secondary)
+                                    
+                                    Text(exportData.split(separator: "\n").prefix(20).joined(separator: "\n"))
+                                        .font(.system(.caption2, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                    
+                                    if exportData.split(separator: "\n").count > 20 {
+                                        Text("... (\(exportData.split(separator: "\n").count - 20) more lines)")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                            .italic()
+                                    }
                                 }
+                                .padding()
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.secondary.opacity(0.1))
+                                .cornerRadius(8)
+                                .padding(.horizontal)
                             }
                         }
                     }
                     
                     // Copy button
-                    Button(action: {
-                        UIPasteboard.general.string = exportData
-                        saveAlertMessage = "Copied to clipboard!"
-                        showingSaveAlert = true
-                    }) {
-                        Label("Copy to Clipboard", systemImage: "doc.on.doc")
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(Color.blue)
-                            .cornerRadius(12)
+                    if !exportData.isEmpty {
+                        Button(action: {
+                            UIPasteboard.general.string = exportData
+                            saveAlertMessage = "Copied to clipboard!"
+                            showingSaveAlert = true
+                        }) {
+                            Label("Copy to Clipboard", systemImage: "doc.on.doc")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.blue)
+                                .cornerRadius(12)
+                        }
+                        .padding(.horizontal)
                     }
-                    .padding(.horizontal)
                     
-                    // Save button for all formats
-                    Button(action: {
-                        showingFilePicker = true
-                    }) {
-                        Label("Save \(exportFormat.rawValue) File", systemImage: "folder.badge.plus")
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(Color.green)
-                            .cornerRadius(12)
+                    // Save button
+                    if !exportData.isEmpty {
+                        Button(action: {
+                            showingFilePicker = true
+                        }) {
+                            Label("Save \(exportFormat.rawValue) File", systemImage: "folder.badge.plus")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.green)
+                                .cornerRadius(12)
+                        }
+                        .padding(.horizontal)
                     }
-                    .padding(.horizontal)
                     
-                    // Share button for both formats
-                    Button(action: {
-                        shareFile()
-                    }) {
-                        Label("Share \(exportFormat.rawValue) File", systemImage: "square.and.arrow.up")
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(Color.orange)
-                            .cornerRadius(12)
+                    // Share button
+                    if !exportData.isEmpty {
+                        Button(action: {
+                            shareFile()
+                        }) {
+                            Label("Share \(exportFormat.rawValue) File", systemImage: "square.and.arrow.up")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.orange)
+                                .cornerRadius(12)
+                        }
+                        .padding(.horizontal)
                     }
-                    .padding(.horizontal)
-                    .disabled(exportData.isEmpty)
                     
                     Spacer()
                         .frame(height: 20)
@@ -616,10 +724,24 @@ struct ExportView: View {
                 }
             }
             .onAppear {
+                print("📋 ExportView appeared")
+                // Auto-generate export data when sheet opens
+                if exportData.isEmpty {
+                    updateExportData()
+                }
+            }
+            .onChange(of: exportFormat) { newFormat in
+                print("📋 Export format changed to: \(newFormat)")
+                // Regenerate when format changes
+                exportData = "" // Clear old data
                 updateExportData()
             }
-            .onChange(of: exportFormat) { _ in
-                updateExportData()
+            .onDisappear {
+                print("📋 ExportView disappearing - cancelling tasks")
+                // Cancel any ongoing export tasks
+                exportTask?.cancel()
+                exportTask = nil
+                isLoading = false
             }
         }
         .sheet(isPresented: $showingFilePicker) {
@@ -639,6 +761,17 @@ struct ExportView: View {
         .sheet(isPresented: $showingShareSheet) {
             if let fileURL = shareFileURL {
                 ShareSheet(activityItems: [fileURL])
+                    .onDisappear {
+                        // Clean up the URL after sharing
+                        print("📤 Share sheet dismissed")
+                    }
+            } else {
+                // This shouldn't happen, but provide fallback
+                Text("No file to share")
+                    .onAppear {
+                        print("⚠️ Share sheet presented without URL!")
+                        showingShareSheet = false
+                    }
             }
         }
         .alert("Save Status", isPresented: $showingSaveAlert) {
@@ -649,24 +782,52 @@ struct ExportView: View {
     }
     
     private func updateExportData() {
+        print("📤 updateExportData called - format: \(exportFormat)")
+        
+        // Cancel any existing task
+        exportTask?.cancel()
+        exportTask = nil
+        
+        // Clear old data and show loading immediately
+        exportData = ""
         isLoading = true
         
-        Task {
-            let data: String
+        // Start export task
+        exportTask = Task { @MainActor in
+            print("   Starting export task...")
             
-            switch exportFormat {
-            case .json:
-                data = scanManager.exportScanData()
-            case .obj:
-                data = await Task.detached(priority: .userInitiated) {
-                    return scanManager.exportAsOBJ() ?? "No mesh data available"
-                }.value
-            }
+            // Capture format value
+            let format = exportFormat
             
-            await MainActor.run {
-                exportData = data
+            // Run export on background queue
+            let data = await Task.detached(priority: .userInitiated) {
+                print("   Running export on background thread...")
+                
+                let result: String
+                switch format {
+                case .json:
+                    print("   Exporting JSON...")
+                    result = self.scanManager.exportScanData()
+                case .obj:
+                    print("   Exporting OBJ...")
+                    result = self.scanManager.exportAsOBJ() ?? "No mesh data available"
+                }
+                
+                print("   Export complete - data length: \(result.count)")
+                return result
+            }.value
+            
+            // Check if cancelled
+            guard !Task.isCancelled else {
+                print("   ⚠️ Task was cancelled")
                 isLoading = false
+                return
             }
+            
+            // Update UI
+            print("   Updating UI with exported data")
+            exportData = data
+            isLoading = false
         }
     }
     
@@ -693,13 +854,11 @@ struct ExportView: View {
     }
     
     private func shareFile() {
-        print("🔄 Preparing file for sharing...")
+        print("🔄 shareFile called")
         
-        // Ensure we have data
+        // Validate export data exists
         guard !exportData.isEmpty else {
             print("❌ No export data available")
-            saveAlertMessage = "No data to share. Please wait for export to complete."
-            showingSaveAlert = true
             return
         }
         
@@ -709,16 +868,37 @@ struct ExportView: View {
         let fileName = "room_scan_\(Date().timeIntervalSince1970).\(fileExtension)"
         let fileURL = tempDir.appendingPathComponent(fileName)
         
+        print("   Creating temp file: \(fileName)")
+        
         do {
+            // Write data to file
             try exportData.write(to: fileURL, atomically: true, encoding: .utf8)
-            print("✅ Created temp \(fileExtension.uppercased()) file at: \(fileURL.path)")
+            print("✅ Created temp \(fileExtension.uppercased()) file")
+            print("   Path: \(fileURL.path)")
+            print("   Size: \(exportData.utf8.count) bytes")
             
-            // Store URL and show share sheet
+            // Verify file exists
+            guard FileManager.default.fileExists(atPath: fileURL.path) else {
+                print("❌ File verification failed")
+                saveAlertMessage = "Failed to create temporary file."
+                showingSaveAlert = true
+                return
+            }
+            
+            print("✅ File verified, preparing to show share sheet")
+            
+            // IMPORTANT: Set the URL first, then trigger the sheet
+            // This ensures the URL is available when the sheet's closure executes
             shareFileURL = fileURL
-            showingShareSheet = true
+            
+            // Give SwiftUI a moment to process the state change
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                print("   Showing share sheet now")
+                showingShareSheet = true
+            }
             
         } catch {
-            print("❌ Error saving \(fileExtension.uppercased()) file: \(error)")
+            print("❌ Error creating file: \(error)")
             saveAlertMessage = "Error creating file: \(error.localizedDescription)"
             showingSaveAlert = true
         }

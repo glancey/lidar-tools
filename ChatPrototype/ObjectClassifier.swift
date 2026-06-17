@@ -386,26 +386,26 @@ class ObjectClassifier {
     }
     
     private func performVisionClassification(on image: CIImage) async -> ClassificationResult? {
-        // Use VNRecognizeObjectsRequest for object detection
-        // Note: Requires iOS 17+ for best results
+        // Use VNClassifyImageRequest for scene classification
+        // Available in iOS 15+ and works well for furniture/room objects
         
-        return await withCheckedContinuation { continuation in
-            let request = VNRecognizeObjectsRequest { request, error in
+        return await withCheckedContinuation { (continuation: CheckedContinuation<ClassificationResult?, Never>) in
+            let request = VNClassifyImageRequest { request, error in
                 guard error == nil,
-                      let observations = request.results as? [VNRecognizedObjectObservation],
+                      let observations = request.results as? [VNClassificationObservation],
                       let topObservation = observations.first else {
                     continuation.resume(returning: nil)
                     return
                 }
                 
                 // Map Vision labels to our categories
-                let label = topObservation.labels.first?.identifier ?? "Unknown"
-                let confidence = topObservation.labels.first?.confidence ?? 0.0
+                let label = topObservation.identifier
+                let confidence = topObservation.confidence
                 let category = self.mapVisionLabelToCategory(label)
                 let isMovable = self.isMovableObject(label)
                 
                 let result = ClassificationResult(
-                    label: label.capitalized,
+                    label: self.cleanupVisionLabel(label),
                     category: category,
                     confidence: confidence,
                     isMovable: isMovable
@@ -415,8 +415,35 @@ class ObjectClassifier {
             }
             
             let handler = VNImageRequestHandler(ciImage: image, options: [:])
-            try? handler.perform([request])
+            do {
+                try handler.perform([request])
+            } catch {
+                print("❌ Vision classification failed: \(error.localizedDescription)")
+                continuation.resume(returning: nil)
+            }
         }
+    }
+    
+    private func cleanupVisionLabel(_ label: String) -> String {
+        // Vision framework returns labels like "table_lamp" or "dining_room"
+        // Clean these up for better display
+        let cleaned = label
+            .replacingOccurrences(of: "_", with: " ")
+            .capitalized
+        
+        // Extract the main object if it's a compound label
+        if cleaned.contains(" ") {
+            let words = cleaned.components(separatedBy: " ")
+            // Look for furniture keywords
+            let furnitureKeywords = ["Chair", "Table", "Sofa", "Bed", "Desk", "Cabinet", "Shelf"]
+            for keyword in furnitureKeywords {
+                if words.contains(keyword) {
+                    return keyword
+                }
+            }
+        }
+        
+        return cleaned
     }
     
     private func mapVisionLabelToCategory(_ label: String) -> ObjectCategory {
