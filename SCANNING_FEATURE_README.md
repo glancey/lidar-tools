@@ -175,8 +175,8 @@ ContentView (root)
 1. Add all new files to Xcode project
 2. Ensure iOS deployment target is iOS 17.0+
 3. Camera and Microphone privacy permissions must be set
-4. Build and run on iPhone with LiDAR
-5. Test both measurement and scanning modes
+4. Build and run on iPhone with LiDAR (Shift + cmd + K) then clean; cmd + b to build; cmd + r to upload to iPhone)
+6. Test both measurement and scanning modes
 
 ---
 
